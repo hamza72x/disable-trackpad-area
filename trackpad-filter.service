@@ -4,7 +4,7 @@ After=systemd-udevd.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/trackpad-filter --left 15 --right 15 --top 20 --bottom 0
+ExecStart=/usr/local/bin/trackpad-filter --left 20 --right 20 --top 25
 Restart=on-failure
 RestartSec=3
 
