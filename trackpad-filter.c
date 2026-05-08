@@ -22,8 +22,10 @@
 #include <sys/ioctl.h>
 
 #define MAX_SLOTS 16
+#define READ_BUF_EVENTS 64
+#define BATCH_MAX_EVENTS 128
 
-static volatile int running = 1;
+static volatile sig_atomic_t running = 1;
 
 static void signal_handler(int sig) {
     (void)sig;
@@ -96,7 +98,7 @@ static int get_axes(int fd, struct trackpad_axes *axes) {
     return 0;
 }
 
-static void compute_boundaries(struct dead_zones *dz, struct trackpad_axes *axes) {
+static void compute_boundaries(struct dead_zones *dz, const struct trackpad_axes *axes) {
     int x_range = axes->x_max - axes->x_min;
     int y_range = axes->y_max - axes->y_min;
 
@@ -106,15 +108,12 @@ static void compute_boundaries(struct dead_zones *dz, struct trackpad_axes *axes
     dz->y_bottom = axes->y_max - y_range * dz->bottom_pct / 100;
 }
 
-static int is_in_dead_zone(struct dead_zones *dz, int x, int y, int has_x, int has_y) {
-    if (has_x) {
-        if (x < dz->x_left || x > dz->x_right)
-            return 1;
-    }
-    if (has_y) {
-        if (y < dz->y_top || y > dz->y_bottom)
-            return 1;
-    }
+static inline __attribute__((always_inline))
+int is_in_dead_zone(const struct dead_zones *dz, int x, int y, int has_x, int has_y) {
+    if (has_x && (x < dz->x_left || x > dz->x_right))
+        return 1;
+    if (has_y && (y < dz->y_top || y > dz->y_bottom))
+        return 1;
     return 0;
 }
 
@@ -123,10 +122,15 @@ static int setup_uinput(int source_fd) {
     struct uinput_setup usetup;
     struct input_absinfo absinfo;
     unsigned long evbits[8] = {0};
-    unsigned long keybits[16] = {0};
-    unsigned long absbits[4] = {0};
-    unsigned long mscbits[2] = {0};
-    unsigned long propbits[2] = {0};
+    unsigned long keybits[(KEY_MAX + 8*sizeof(long) - 1) / (8*sizeof(long))];
+    unsigned long absbits[(ABS_MAX + 8*sizeof(long) - 1) / (8*sizeof(long))];
+    unsigned long mscbits[(MSC_MAX + 8*sizeof(long) - 1) / (8*sizeof(long))];
+    unsigned long propbits[(INPUT_PROP_MAX + 8*sizeof(long) - 1) / (8*sizeof(long))];
+
+    memset(keybits, 0, sizeof(keybits));
+    memset(absbits, 0, sizeof(absbits));
+    memset(mscbits, 0, sizeof(mscbits));
+    memset(propbits, 0, sizeof(propbits));
 
     ufd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
     if (ufd < 0) {
@@ -224,7 +228,6 @@ static void print_usage(const char *prog) {
 int main(int argc, char **argv) {
     char devpath[64];
     int src_fd, uinput_fd;
-    struct input_event ev;
     struct trackpad_axes axes;
     struct dead_zones dz = { .left_pct = 15, .right_pct = 15, .top_pct = 20, .bottom_pct = 0 };
 
@@ -236,6 +239,7 @@ int main(int argc, char **argv) {
     int slot_blocked[MAX_SLOTS] = {0};
     int slot_tracking[MAX_SLOTS] = {0};
     int current_slot = 0;
+    int active_unblocked = 0; /* count of active slots not in dead zone */
 
     /* Single-touch tracking */
     int st_x = 0, st_y = 0;
@@ -262,6 +266,10 @@ int main(int argc, char **argv) {
     }
 
     /* Validate */
+    if (dz.left_pct < 0 || dz.right_pct < 0 || dz.top_pct < 0 || dz.bottom_pct < 0) {
+        fprintf(stderr, "Error: Percentages cannot be negative\n");
+        return 1;
+    }
     if (dz.left_pct + dz.right_pct >= 100 || dz.top_pct + dz.bottom_pct >= 100) {
         fprintf(stderr, "Error: Dead zones exceed 100%% of trackpad area\n");
         return 1;
@@ -319,117 +327,147 @@ int main(int argc, char **argv) {
     printf("Filter active. Send SIGTERM to stop.\n");
     fflush(stdout);
 
-    /* Event buffer for batching */
-    struct input_event batch[64];
+    /* Buffers */
+    struct input_event read_buf[READ_BUF_EVENTS];
+    struct input_event batch[BATCH_MAX_EVENTS];
     int batch_count = 0;
+    int has_lift = 0; /* flag: batch contains a finger-lift event */
 
     while (running) {
-        ssize_t n = read(src_fd, &ev, sizeof(ev));
-        if (n != sizeof(ev)) {
+        ssize_t bytes = read(src_fd, read_buf, sizeof(read_buf));
+        if (bytes < 0) {
             if (errno == EINTR) continue;
             break;
         }
 
-        if (ev.type == EV_ABS) {
-            switch (ev.code) {
-            case ABS_MT_SLOT:
-                current_slot = ev.value;
-                if (current_slot >= MAX_SLOTS) current_slot = MAX_SLOTS - 1;
-                break;
+        int nevents = bytes / sizeof(struct input_event);
 
-            case ABS_MT_TRACKING_ID:
-                if (ev.value == -1) {
-                    slot_blocked[current_slot] = 0;
-                    slot_tracking[current_slot] = 0;
-                    slot_has_x[current_slot] = 0;
-                    slot_has_y[current_slot] = 0;
-                } else {
-                    slot_tracking[current_slot] = 1;
-                    slot_blocked[current_slot] = 0;
-                    slot_has_x[current_slot] = 0;
-                    slot_has_y[current_slot] = 0;
-                }
-                break;
+        for (int ei = 0; ei < nevents; ei++) {
+            struct input_event *ev = &read_buf[ei];
 
-            case ABS_MT_POSITION_X:
-                slot_x[current_slot] = ev.value;
-                slot_has_x[current_slot] = 1;
-                if (!slot_blocked[current_slot]) {
-                    if (slot_has_y[current_slot]) {
-                        if (is_in_dead_zone(&dz, slot_x[current_slot], slot_y[current_slot], 1, 1))
-                            slot_blocked[current_slot] = 1;
-                    } else {
-                        if (is_in_dead_zone(&dz, ev.value, 0, 1, 0))
-                            slot_blocked[current_slot] = 1;
+            if (ev->type == EV_ABS) {
+                switch (ev->code) {
+                case ABS_MT_SLOT:
+                    current_slot = ev->value;
+                    if (current_slot < 0 || current_slot >= MAX_SLOTS) {
+                        current_slot = (current_slot < 0) ? 0 : MAX_SLOTS - 1;
                     }
-                }
-                break;
+                    break;
 
-            case ABS_MT_POSITION_Y:
-                slot_y[current_slot] = ev.value;
-                slot_has_y[current_slot] = 1;
-                if (!slot_blocked[current_slot]) {
-                    if (slot_has_x[current_slot]) {
-                        if (is_in_dead_zone(&dz, slot_x[current_slot], slot_y[current_slot], 1, 1))
-                            slot_blocked[current_slot] = 1;
+                case ABS_MT_TRACKING_ID:
+                    if (ev->value == -1) {
+                        /* Finger lifted */
+                        if (slot_tracking[current_slot] && !slot_blocked[current_slot])
+                            active_unblocked--;
+                        slot_blocked[current_slot] = 0;
+                        slot_tracking[current_slot] = 0;
+                        slot_has_x[current_slot] = 0;
+                        slot_has_y[current_slot] = 0;
+                        has_lift = 1;
                     } else {
-                        if (is_in_dead_zone(&dz, 0, ev.value, 0, 1))
-                            slot_blocked[current_slot] = 1;
+                        /* New finger */
+                        slot_tracking[current_slot] = 1;
+                        slot_blocked[current_slot] = 0;
+                        slot_has_x[current_slot] = 0;
+                        slot_has_y[current_slot] = 0;
+                        /* Will be counted as unblocked once position confirms */
+                        active_unblocked++;
                     }
-                }
-                break;
+                    break;
 
-            case ABS_X:
-                st_x = ev.value;
-                st_has_x = 1;
-                break;
-            case ABS_Y:
-                st_y = ev.value;
-                st_has_y = 1;
-                break;
-            }
-        }
+                case ABS_MT_POSITION_X:
+                    slot_x[current_slot] = ev->value;
+                    slot_has_x[current_slot] = 1;
+                    if (!slot_blocked[current_slot]) {
+                        int blocked = 0;
+                        if (slot_has_y[current_slot])
+                            blocked = is_in_dead_zone(&dz, ev->value, slot_y[current_slot], 1, 1);
+                        else
+                            blocked = is_in_dead_zone(&dz, ev->value, 0, 1, 0);
+                        if (blocked) {
+                            slot_blocked[current_slot] = 1;
+                            active_unblocked--;
+                        }
+                    }
+                    break;
 
-        if (ev.type == EV_SYN && ev.code == SYN_REPORT) {
-            int forward = 0;
-            int all_blocked = 1;
+                case ABS_MT_POSITION_Y:
+                    slot_y[current_slot] = ev->value;
+                    slot_has_y[current_slot] = 1;
+                    if (!slot_blocked[current_slot]) {
+                        int blocked = 0;
+                        if (slot_has_x[current_slot])
+                            blocked = is_in_dead_zone(&dz, slot_x[current_slot], ev->value, 1, 1);
+                        else
+                            blocked = is_in_dead_zone(&dz, 0, ev->value, 0, 1);
+                        if (blocked) {
+                            slot_blocked[current_slot] = 1;
+                            active_unblocked--;
+                        }
+                    }
+                    break;
 
-            for (int i = 0; i < MAX_SLOTS; i++) {
-                if (slot_tracking[i] && !slot_blocked[i]) {
-                    all_blocked = 0;
-                    forward = 1;
+                case ABS_X:
+                    st_x = ev->value;
+                    st_has_x = 1;
+                    break;
+                case ABS_Y:
+                    st_y = ev->value;
+                    st_has_y = 1;
                     break;
                 }
             }
 
-            /* Always forward lift events */
-            for (int i = 0; i < batch_count; i++) {
-                if (batch[i].type == EV_ABS && batch[i].code == ABS_MT_TRACKING_ID
-                    && batch[i].value == -1) {
+            if (ev->type == EV_SYN && ev->code == SYN_REPORT) {
+                int forward = 0;
+
+                /* Forward if any active finger is outside dead zone */
+                if (active_unblocked > 0)
                     forward = 1;
-                    break;
-                }
-            }
 
-            /* Single-touch fallback */
-            if (all_blocked && st_has_x && st_has_y) {
-                if (!is_in_dead_zone(&dz, st_x, st_y, 1, 1))
+                /* Always forward lift events (so libinput sees finger-up) */
+                if (has_lift)
                     forward = 1;
-            }
 
-            if (forward) {
-                for (int i = 0; i < batch_count; i++) {
-                    write(uinput_fd, &batch[i], sizeof(batch[i]));
+                /* Single-touch fallback (non-MT path) */
+                if (!forward && st_has_x && st_has_y) {
+                    if (!is_in_dead_zone(&dz, st_x, st_y, 1, 1))
+                        forward = 1;
                 }
-                write(uinput_fd, &ev, sizeof(ev));
-            }
 
-            batch_count = 0;
-            st_has_x = 0;
-            st_has_y = 0;
-        } else {
-            if (batch_count < 64) {
-                batch[batch_count++] = ev;
+                if (forward && batch_count > 0) {
+                    /* Batch write: single syscall for all buffered events + SYN */
+                    batch[batch_count++] = *ev;
+                    ssize_t total = batch_count * sizeof(struct input_event);
+                    ssize_t written = write(uinput_fd, batch, total);
+                    if (written < 0) {
+                        perror("write uinput");
+                    } else if (written < total) {
+                        /* Partial write - write remainder */
+                        ssize_t rem = total - written;
+                        char *p = (char *)batch + written;
+                        while (rem > 0) {
+                            ssize_t w = write(uinput_fd, p, rem);
+                            if (w <= 0) break;
+                            p += w;
+                            rem -= w;
+                        }
+                    }
+                } else if (forward) {
+                    /* Only SYN in batch (empty frame with just sync) */
+                    write(uinput_fd, ev, sizeof(*ev));
+                }
+
+                batch_count = 0;
+                has_lift = 0;
+                st_has_x = 0;
+                st_has_y = 0;
+            } else {
+                /* Buffer event */
+                if (batch_count < BATCH_MAX_EVENTS - 1) {
+                    batch[batch_count++] = *ev;
+                }
+                /* -1 reserves space for SYN_REPORT in batch write */
             }
         }
     }
